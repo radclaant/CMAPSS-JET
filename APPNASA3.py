@@ -1,7 +1,9 @@
 # ==========================================
-# APP PANEL DE CONTROL - NASA C-MAPSS v3.0
+# APP PANEL DE CONTROL - NASA C-MAPSS v4.0
+# VERSIÓN: CON MODELOS PRE-ENTRENADOS INTEGRADOS
 # ==========================================
-
+import os
+import joblib
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,6 +13,141 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 st.set_page_config(page_title="NASA Turbofan C-MAPSS", page_icon="🚀", layout="wide")
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# 1. RUTAS Y CONFIGURACIÓN
+# ═════════════════════════════════════════════════════════════════════════════════
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FOLDER_PKLS = os.path.join(BASE_DIR, 'pkls')
+
+# Mapeo de FD00X a dataset_id (para cargar los archivos pkl correctos)
+FD_MAPPING = {
+    "FD001 - Nivel del Mar (HPC)": "FD001",
+    "FD002 - 6 Condiciones (HPC)": "FD002",
+    "FD003 - Nivel del Mar (HPC + Fan)": "FD003",
+    "FD004 - 6 Condiciones (HPC + Fan)": "FD004",
+}
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# 2. FUNCIONES DE CARGA DE MODELOS
+# ═════════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def cargar_cerebros_ia(dataset_id):
+    """
+    Carga los 3 componentes pre-entrenados desde /pkls:
+    - modelo_rf (Random Forest para predicción de RUL)
+    - kmeans (para clasificación de regímenes operacionales)
+    - features (lista de características esperadas por el modelo)
+    """
+    try:
+        path_mod = os.path.join(FOLDER_PKLS, f'modelo_rf_{dataset_id}.pkl')
+        path_km  = os.path.join(FOLDER_PKLS, f'kmeans_{dataset_id}.pkl')
+        path_feat = os.path.join(FOLDER_PKLS, f'features_{dataset_id}.pkl')
+        
+        # Validar que los archivos existan
+        if not os.path.exists(path_mod):
+            st.error(f"❌ Modelo no encontrado: {path_mod}")
+            return None, None, None
+        if not os.path.exists(path_km):
+            st.error(f"❌ KMeans no encontrado: {path_km}")
+            return None, None, None
+        if not os.path.exists(path_feat):
+            st.error(f"❌ Features no encontrado: {path_feat}")
+            return None, None, None
+        
+        # Cargar los archivos
+        modelo = joblib.load(path_mod)
+        kmeans = joblib.load(path_km)
+        features = joblib.load(path_feat)
+        
+        st.toast(f"✅ Modelos {dataset_id} cargados correctamente", icon="✨")
+        return modelo, kmeans, features
+        
+    except Exception as e:
+        st.error(f"❌ Error al cargar modelos {dataset_id}: {str(e)}")
+        return None, None, None
+
+
+def procesar_y_predecir(df_crudo, modelo, kmeans, features):
+    """
+    Procesamiento idéntico al Colab:
+    1. Renombra columnas de settings
+    2. Clasifica regímenes operacionales con KMeans
+    3. Normaliza sensores por régimen
+    4. Calcula características temporales (media móvil, desv. estándar)
+    5. Extrae el último ciclo de cada motor
+    6. Realiza predicción del RUL con el modelo Random Forest
+    
+    Retorna: dict con {id_motor: rul_predicho}
+    """
+    if modelo is None or kmeans is None or features is None:
+        st.error("❌ Los modelos no están cargados. Revisa que los archivos .pkl existan.")
+        return {}
+    
+    df = df_crudo.copy()
+    
+    # Paso 1: Renombrar columnas de settings para coincidir con entrenamiento
+    df.rename(columns={
+        'setting_1': 'ajuste1', 
+        'setting_2': 'ajuste2', 
+        'setting_3': 'ajuste3'
+    }, inplace=True)
+    
+    # Paso 2: Clasificar regímenes operacionales
+    try:
+        df['regimen'] = kmeans.predict(df[['ajuste1', 'ajuste2', 'ajuste3']])
+    except Exception as e:
+        st.error(f"❌ Error al predecir regímenes: {e}")
+        return {}
+    
+    # Paso 3 & 4: Normalización y características temporales
+    sensores = [c for c in df.columns if 'sensor' in c]
+    VENTANA_MOVIL = 15  # Ventana para cálculo de media y desv. móviles
+    
+    for s in sensores:
+        # Normalizar por régimen (min-max scaling dentro de cada régimen)
+        df[s] = df.groupby('regimen')[s].transform(
+            lambda x: (x - x.min()) / (x.max() - x.min() + 1e-9)
+        )
+        
+        # Media móvil por motor
+        df[f'{s}_media_movil'] = df.groupby('id_motor')[s].transform(
+            lambda x: x.rolling(VENTANA_MOVIL, min_periods=1).mean()
+        )
+        
+        # Desviación estándar móvil por motor
+        df[f'{s}_std_movil'] = df.groupby('id_motor')[s].transform(
+            lambda x: x.rolling(VENTANA_MOVIL, min_periods=1).std().fillna(0)
+        )
+    
+    # Paso 5: Tomar último ciclo de cada motor (estado actual)
+    df_last = df.groupby('id_motor').last().reset_index()
+    
+    # Paso 6: Validar que las características requeridas existan
+    features_faltantes = [f for f in features if f not in df_last.columns]
+    if features_faltantes:
+        st.warning(f"⚠️ Características faltantes: {features_faltantes}")
+    
+    # Preparar matriz X con las features correctas
+    X = df_last[features]
+    
+    # Predicción del RUL
+    try:
+        predicciones = modelo.predict(X)
+        # Asegurar que RUL sea positivo y entero
+        predicciones = np.maximum(predicciones, 0)  # RUL >= 0
+        rul_dict = dict(zip(df_last['id_motor'].astype(int), np.round(predicciones).astype(int)))
+        return rul_dict
+    except Exception as e:
+        st.error(f"❌ Error durante predicción: {e}")
+        return {}
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# 3. ESTILOS Y CONFIGURACIÓN VISUAL
+# ═════════════════════════════════════════════════════════════════════════════════
 
 st.markdown("""
     <style>
@@ -54,7 +191,12 @@ SENSOR_INFO = {
 sensores_criticos = [k for k, v in SENSOR_INFO.items() if v['critico']]
 sensores_estables = [k for k, v in SENSOR_INFO.items() if not v['critico']]
 
+# ═════════════════════════════════════════════════════════════════════════════════
+# 4. FUNCIONES DE CARGA Y PROCESAMIENTO DE DATOS
+# ═════════════════════════════════════════════════════════════════════════════════
+
 def cargar_telemetria(archivo):
+    """Carga datos en formato NASA (.txt) o CSV"""
     nombre = archivo.name.lower()
     if nombre.endswith('.txt'):
         df = pd.read_csv(archivo, sep=r'\s+', header=None, engine='python')
@@ -70,6 +212,7 @@ def cargar_telemetria(archivo):
 
 @st.cache_data
 def generar_datos_prueba():
+    """Genera datos sintéticos para demostración"""
     filas = []
     for motor in range(1, 6):
         vida_util = np.random.randint(120, 200)
@@ -106,6 +249,7 @@ def generar_datos_prueba():
 
 @st.cache_data
 def calcular_rul_flota(df):
+    """Calcula RUL teórico basado en ciclos máximos"""
     max_c = df.groupby('id_motor')['ciclo'].max().reset_index()
     max_c.columns = ['id_motor', 'max_ciclo']
     df2 = df.merge(max_c, on='id_motor')
@@ -114,6 +258,7 @@ def calcular_rul_flota(df):
 
 @st.cache_data
 def calcular_importancia(df_rul):
+    """Calcula correlación de sensores con RUL"""
     imp = {}
     for s in sensores_criticos:
         corr = abs(df_rul[s].corr(df_rul['RUL']))
@@ -121,6 +266,7 @@ def calcular_importancia(df_rul):
     return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
 
 def generar_reporte_csv(df, tabla_rul):
+    """Genera reporte en CSV con predicciones"""
     buf = io.StringIO()
     buf.write("REPORTE NASA C-MAPSS - MANTENIMIENTO PREDICTIVO\n\n")
     buf.write("=== PREDICCIONES RUL POR MOTOR ===\n")
@@ -130,16 +276,24 @@ def generar_reporte_csv(df, tabla_rul):
     ultimo.to_csv(buf, index=False)
     return buf.getvalue().encode('utf-8')
 
-# ── SIDEBAR ────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════════
+# 5. SIDEBAR - CONFIGURACIÓN
+# ═════════════════════════════════════════════════════════════════════════════════
+
 st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/e/e5/NASA_logo.svg", width=150)
 st.sidebar.title("Centro de Comando")
 st.sidebar.markdown("---")
 
+# Selector de Perfil Operativo (Dataset)
 tipo_fd = st.sidebar.selectbox(
     "1. Seleccione Perfil Operativo (Dataset)",
-    ("FD001 - Nivel del Mar (HPC)", "FD002 - 6 Condiciones (HPC)",
-     "FD003 - Nivel del Mar (HPC + Fan)", "FD004 - 6 Condiciones (HPC + Fan)")
+    ("FD001 - Nivel del Mar (HPC)", 
+     "FD002 - 6 Condiciones (HPC)",
+     "FD003 - Nivel del Mar (HPC + Fan)", 
+     "FD004 - 6 Condiciones (HPC + Fan)")
 )
+
+# Información sobre el dataset seleccionado
 if "FD001" in tipo_fd:
     st.sidebar.info("FD001: Condicion estable (nivel del mar). Desgaste en el HPC.")
 elif "FD002" in tipo_fd:
@@ -150,11 +304,16 @@ elif "FD004" in tipo_fd:
     st.sidebar.error("FD004: 6 condiciones + fallas en HPC y Fan.")
 
 st.sidebar.markdown("---")
+
+# Cargador de archivo de telemetría
 archivo_subido = st.sidebar.file_uploader(
     "2. Cargar Telemetria (TXT/CSV)", type=['txt', 'csv'],
     help="Formato original NASA (.txt) o CSV con encabezado."
 )
+
 st.sidebar.markdown("---")
+
+# Datos de prueba
 df_sintetico = generar_datos_prueba()
 txt_sintetico = df_sintetico.to_csv(index=False, header=False, sep=' ').encode('utf-8')
 st.sidebar.markdown("**Datos de prueba**")
@@ -165,16 +324,27 @@ st.sidebar.download_button(
     mime='text/plain',
 )
 
-# ── MAIN ───────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════════
+# 6. MAIN - LÓGICA PRINCIPAL
+# ═════════════════════════════════════════════════════════════════════════════════
+
 st.title("Sistema de Mantenimiento Predictivo Aerospacial")
 st.markdown("Monitor de degradacion de motores Turbofan - NASA C-MAPSS Dataset.")
 
+# Obtener dataset_id a partir de tipo_fd
+dataset_id = FD_MAPPING.get(tipo_fd, "FD001")
+
+# Cargar modelos pre-entrenados
+modelo, kmeans, features = cargar_cerebros_ia(dataset_id)
+
+# Validar que tenemos datos a procesar
 if archivo_subido is None:
     st.warning("Esperando telemetria. Cargue un archivo .txt (formato NASA) o .csv en el panel izquierdo.")
     st.markdown("#### Asi lucen los datos esperados (muestra sintetica):")
     st.dataframe(df_sintetico.head(10), use_container_width=True)
     st.stop()
 
+# Cargar y procesar telemetría
 with st.spinner('Procesando telemetria...'):
     time.sleep(1)
     try:
@@ -189,10 +359,19 @@ if 'id_motor' not in df_cargado.columns:
     st.error("El archivo no tiene el formato esperado (columna id_motor no encontrada).")
     st.stop()
 
+# PREDICCIÓN REAL CON EL MODELO
+with st.spinner(f'Ejecutando predicciones con modelo {dataset_id}...'):
+    rul_predicho_dict = procesar_y_predecir(df_cargado, modelo, kmeans, features)
+
+if not rul_predicho_dict:
+    st.error("❌ No se pudieron generar predicciones. Revisa los modelos y datos.")
+    st.stop()
+
 df_rul = calcular_rul_flota(df_cargado)
 lista_motores = sorted(df_cargado['id_motor'].unique())
-st.success(f"Telemetria procesada - {len(df_cargado):,} registros - {len(lista_motores)} motores detectados.")
+st.success(f"✅ Telemetria procesada - {len(df_cargado):,} registros - {len(lista_motores)} motores detectados.")
 
+# Métricas globales
 k1, k2, k3, k4 = st.columns(4)
 with k1: st.metric("Motores en Flota", len(lista_motores))
 with k2: st.metric("MAE del Modelo", "11.85 ciclos")
@@ -205,9 +384,9 @@ st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs(["Diagnostico Individual", "Analisis de Flota", "Base de Datos Cruda", "🚀 Tripulación"])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
+# TAB 1 - DIAGNÓSTICO INDIVIDUAL
+# ═════════════════════════════════════════════════════════════════════════════════
 with tab1:
     motor_sel = st.selectbox("Seleccione Motor:", lista_motores, key="motor_tab1")
     datos_motor = (df_cargado[df_cargado['id_motor'] == motor_sel]
@@ -218,22 +397,23 @@ with tab1:
     ciclo_degradacion = int(max_ciclo * 0.75)
     VENTANA           = 10
 
+    # Obtener RUL predicho del diccionario del modelo
+    rul_predicho = rul_predicho_dict.get(motor_sel, 0)
+
     col_rul, col_vida, col_crit = st.columns(3)
-    rul_predicho = max(5, int(max_ciclo * np.random.uniform(0.05, 0.5)))
     with col_rul:
         if rul_predicho > 80:
             st.success(f"### {rul_predicho} ciclos restantes\nESTADO: OPTIMO")
         elif rul_predicho > 30:
             st.warning(f"### {rul_predicho} ciclos restantes\nESTADO: ALERTA")
         else:
-            #st.error("🚨 ¡HOUSTON, TENEMOS UN PROBLEMA! 🚨")
             st.error(f"### {rul_predicho} ciclos restantes\nESTADO: CRITICO")
     with col_vida:
         st.metric("Vida util observada", f"{max_ciclo} ciclos")
     with col_crit:
         st.metric("Inicio zona critica", f"ciclo {ciclo_degradacion}")
 
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:4px'></div>", unsafe_html=True)
 
     ciclo_radar = st.slider(
         "Ciclo para el Radar de Salud",
@@ -408,24 +588,23 @@ with tab1:
     st.dataframe(pd.DataFrame(filas_est), use_container_width=True, hide_index=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 # TAB 2 — FLOTA
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.header("Analisis Global de la Flota")
 
-    max_por_motor = df_cargado.groupby('id_motor')['ciclo'].max()
-    rul_sim = {m: max(5, int(v * np.random.uniform(0.05, 0.5))) for m, v in max_por_motor.items()}
-
     tabla_rul = pd.DataFrame([{
         "Motor":             f"Motor {m}",
-        "Ciclos observados": int(max_por_motor[m]),
-        "RUL Predicho":      rul_sim[m],
-        "Estado":            ("OPTIMO" if rul_sim[m] > 80 else "ALERTA" if rul_sim[m] > 30 else "CRITICO"),
-        "% Vida consumida":  f"{(1 - rul_sim[m]/max(max_por_motor[m],1))*100:.1f}%",
+        "Ciclos observados": int(df_cargado[df_cargado['id_motor'] == m]['ciclo'].max()),
+        "RUL Predicho":      rul_predicho_dict.get(m, 0),  # Usar predicciones reales
+        "Estado":            ("OPTIMO" if rul_predicho_dict.get(m, 0) > 80 
+                            else "ALERTA" if rul_predicho_dict.get(m, 0) > 30 
+                            else "CRITICO"),
+        "% Vida consumida":  f"{(1 - rul_predicho_dict.get(m, 1)/max(df_cargado[df_cargado['id_motor']==m]['ciclo'].max(),1))*100:.1f}%",
     } for m in lista_motores])
 
-    rul_vals = list(rul_sim.values())
+    rul_vals = [rul_predicho_dict.get(m, 0) for m in lista_motores]
     fk1, fk2, fk3, fk4, fk5 = st.columns(5)
     with fk1: st.metric("Total Motores",    len(lista_motores))
     with fk2: st.metric("RUL Promedio",     f"{np.mean(rul_vals):.0f} ciclos")
@@ -572,13 +751,12 @@ with tab2:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 # TAB 3 — DATOS CRUDOS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 with tab3:
     st.header("📂 Explorador de Telemetría (Datos Crudos)")
     
-    # --- LÓGICA DE BOTONES DE SELECCIÓN RÁPIDA ---
     col_btn1, col_btn2, _ = st.columns([1, 1, 4])
     
     if col_btn1.button("✅ Sel. Todos"):
@@ -587,28 +765,24 @@ with tab3:
     if col_btn2.button("🗑️ Limpiar"):
         st.session_state.motores_filtro = []
 
-    # Inicializar el estado si no existe
     if 'motores_filtro' not in st.session_state:
         st.session_state.motores_filtro = [lista_motores[0]]
 
-    # El Multiselect ahora usa el 'key' vinculado al estado de sesión
     motores_seleccionados = st.multiselect(
         "Filtrar por ID de Motor:",
         options=lista_motores,
-        key="motores_filtro", # Esto conecta el widget con los botones de arriba
+        key="motores_filtro",
         help="Selecciona los motores para ver su telemetría completa."
     )
 
     if motores_seleccionados:
         df_filtrado = df_cargado[df_cargado['id_motor'].isin(motores_seleccionados)]
         
-        # Métricas de la tabla
         c1, c2, c3 = st.columns(3)
         c1.metric("Filas en vista", f"{len(df_filtrado)}")
         c2.metric("Motores", f"{len(motores_seleccionados)}")
         c3.info("💡 Tip: Haz clic en las columnas para ordenar.")
 
-        # Tabla interactiva
         st.dataframe(
             df_filtrado, 
             use_container_width=True, 
@@ -618,13 +792,12 @@ with tab3:
         st.info("💡 Usa los botones de arriba o selecciona un motor para inspeccionar los datos.")
 
 
-# --- AÑADE '🚀 Tripulación' A TU LISTA DE TABS EXISTENTE ---
-# Ejemplo: tab1, tab2, tab3, tab4 = st.tabs(["...", "...", "...", "🚀 Tripulación"])
-
-with tab4: # Suponiendo que es la cuarta pestaña
+# ═════════════════════════════════════════════════════════════════════════════════
+# TAB 4 — TRIPULACIÓN
+# ═════════════════════════════════════════════════════════════════════════════════
+with tab4:
     st.markdown("<br>", unsafe_allow_html=True)
     
-    # Cabecera con el icono de astronauta/luna que pediste
     col_icon, col_title = st.columns([1, 8])
     with col_icon:
         st.image("https://cdn-icons-png.flaticon.com/512/6741/6741064.png", width=80)
@@ -634,7 +807,6 @@ with tab4: # Suponiendo que es la cuarta pestaña
 
     st.markdown("---")
 
-    # --- SECCIÓN DE CREADORES ---
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -651,11 +823,8 @@ with tab4: # Suponiendo que es la cuarta pestaña
         **Optimización de Procesos** Experta en modelamiento de flujos operativos y gestión de restricciones industriales.
         """)
 
-
-
     st.markdown("---")
 
-    # --- INFORMACIÓN DEL PROYECTO (FILOSOFÍA NASA) ---
     c_info1, c_info2 = st.columns(2)
 
     with c_info1:
