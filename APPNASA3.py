@@ -40,34 +40,26 @@ def cargar_cerebros_ia(dataset_id):
     - modelo_rf (Random Forest para predicción de RUL)
     - kmeans (para clasificación de regímenes operacionales)
     - features (lista de características esperadas por el modelo)
+
+    NO debe contener ningún st.* — el caché no puede reproducirlos.
+    Los errores se devuelven como strings y se muestran fuera de esta función.
     """
+    path_mod  = os.path.join(FOLDER_PKLS, f'modelo_rf_{dataset_id}.pkl')
+    path_km   = os.path.join(FOLDER_PKLS, f'kmeans_{dataset_id}.pkl')
+    path_feat = os.path.join(FOLDER_PKLS, f'features_{dataset_id}.pkl')
+
+    # Validar existencia de archivos (sin st.*)
+    for path, nombre in [(path_mod, 'modelo_rf'), (path_km, 'kmeans'), (path_feat, 'features')]:
+        if not os.path.exists(path):
+            return None, None, None, f"❌ Archivo no encontrado: {path}"
+
     try:
-        path_mod = os.path.join(FOLDER_PKLS, f'modelo_rf_{dataset_id}.pkl')
-        path_km  = os.path.join(FOLDER_PKLS, f'kmeans_{dataset_id}.pkl')
-        path_feat = os.path.join(FOLDER_PKLS, f'features_{dataset_id}.pkl')
-        
-        # Validar que los archivos existan
-        if not os.path.exists(path_mod):
-            st.error(f"❌ Modelo no encontrado: {path_mod}")
-            return None, None, None
-        if not os.path.exists(path_km):
-            st.error(f"❌ KMeans no encontrado: {path_km}")
-            return None, None, None
-        if not os.path.exists(path_feat):
-            st.error(f"❌ Features no encontrado: {path_feat}")
-            return None, None, None
-        
-        # Cargar los archivos
-        modelo = joblib.load(path_mod)
-        kmeans = joblib.load(path_km)
+        modelo   = joblib.load(path_mod)
+        kmeans   = joblib.load(path_km)
         features = joblib.load(path_feat)
-        
-        st.toast(f"✅ Modelos {dataset_id} cargados correctamente", icon="✨")
-        return modelo, kmeans, features
-        
+        return modelo, kmeans, features, None   # None = sin error
     except Exception as e:
-        st.error(f"❌ Error al cargar modelos {dataset_id}: {str(e)}")
-        return None, None, None
+        return None, None, None, f"❌ Error al cargar modelos {dataset_id}: {str(e)}"
 
 
 def procesar_y_predecir(df_crudo, modelo, kmeans, features):
@@ -334,8 +326,14 @@ st.markdown("Monitor de degradacion de motores Turbofan - NASA C-MAPSS Dataset."
 # Obtener dataset_id a partir de tipo_fd
 dataset_id = FD_MAPPING.get(tipo_fd, "FD001")
 
-# Cargar modelos pre-entrenados
-modelo, kmeans, features = cargar_cerebros_ia(dataset_id)
+# Cargar modelos pre-entrenados (los st.* van FUERA de la función cacheada)
+modelo, kmeans, features, error_carga = cargar_cerebros_ia(dataset_id)
+if error_carga:
+    st.error(error_carga)
+    st.info("💡 Asegúrate de que la carpeta `pkls/` exista junto al script y contenga los archivos .pkl del dataset seleccionado.")
+    st.stop()
+else:
+    st.toast(f"✅ Modelos {dataset_id} cargados correctamente", icon="✨")
 
 # Validar que tenemos datos a procesar
 if archivo_subido is None:
@@ -413,7 +411,7 @@ with tab1:
     with col_crit:
         st.metric("Inicio zona critica", f"ciclo {ciclo_degradacion}")
 
-    st.markdown("<div style='height:4px'></div>", unsafe_html=True)
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
     ciclo_radar = st.slider(
         "Ciclo para el Radar de Salud",
